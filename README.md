@@ -27,7 +27,9 @@ Each has a unique `kid` (UUID hex) carried in the JWT header.
     jwks_server/main.py   uvicorn entry point (port 8080)
     tests/test_app.py     test suite
 
-## Screenshots to add before submitting
+## Screenshots
 
-Add screenshots (with your name/identifying info visible) of the grading test client
-running against the server and of the `pytest` coverage output.
+- Gradebot (test client) against this server: `screenshots/gradebot.png`
+- Test suite with coverage (92%): `screenshots/test_coverage.png`
+
+Run Gradebot with: `gradebot project-1 --dir . --run "python -m jwks_server.main"`
