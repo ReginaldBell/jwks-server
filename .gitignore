@@ -2,3 +2,5 @@ __pycache__/
 .pytest_cache/
 .coverage
 .ruff_cache/
+*.db
+*.db-journal

@@ -1,48 +1,37 @@
-"""RSA key generation and an in-memory key store with expiry."""
+"""RSA key generation, PEM (de)serialization, JWK conversion and DB seeding."""
 
 import base64
-import time
-import uuid
-from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from .db import KeyDatabase, StoredKey
+
 KEY_SIZE = 2048
-VALID_LIFETIME_SECONDS = 3600  # unexpired key is good for one hour
-EXPIRED_AGE_SECONDS = 3600  # expired key expired one hour ago
+VALID_LIFETIME_SECONDS = 3600  # an unexpired key is good for one hour
+EXPIRED_AGE_SECONDS = 3600  # an expired key expired one hour ago
 
 
-@dataclass(frozen=True)
-class KeyRecord:
-    """An RSA private key with its unique key ID (kid) and expiry (unix seconds)."""
+def generate_private_key() -> rsa.RSAPrivateKey:
+    """Generate a fresh RSA key pair."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
 
-    private_key: rsa.RSAPrivateKey
-    expires_at: int
-    kid: str = field(default_factory=lambda: uuid.uuid4().hex)
 
-    def is_expired(self, now: float | None = None) -> bool:
-        return self.expires_at <= (time.time() if now is None else now)
+def serialize_private_key(private_key: rsa.RSAPrivateKey) -> bytes:
+    """PKCS#1 PEM bytes: SQLite has no key type, so keys are stored as text/blob."""
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
 
-    def private_pem(self) -> bytes:
-        """PKCS#8 PEM encoding, the format PyJWT expects for signing."""
-        return self.private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
 
-    def to_jwk(self) -> dict[str, str]:
-        """Public half of the key as a JWK (RFC 7517 / 7518 section 6.3)."""
-        numbers = self.private_key.public_key().public_numbers()
-        return {
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "kid": self.kid,
-            "n": _b64url_uint(numbers.n),
-            "e": _b64url_uint(numbers.e),
-        }
+def load_private_key(pem: bytes) -> rsa.RSAPrivateKey:
+    """Inverse of serialize_private_key."""
+    key = serialization.load_pem_private_key(pem, password=None)
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise ValueError("stored key is not an RSA private key")
+    return key
 
 
 def _b64url_uint(value: int) -> str:
@@ -51,23 +40,35 @@ def _b64url_uint(value: int) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def generate_key(expires_at: int) -> KeyRecord:
-    """Generate a fresh RSA key pair with a new kid that expires at `expires_at`."""
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
-    return KeyRecord(private_key=private_key, expires_at=expires_at)
+def to_jwk(stored: StoredKey) -> dict[str, str]:
+    """Public half of a stored key as a JWK (RFC 7517 / 7518 section 6.3)."""
+    numbers = load_private_key(stored.pem).public_key().public_numbers()
+    return {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": str(stored.kid),
+        "n": _b64url_uint(numbers.n),
+        "e": _b64url_uint(numbers.e),
+    }
 
 
-class KeyStore:
-    """Holds one currently-valid key and one already-expired key."""
+def create_key(db: KeyDatabase, exp: int) -> StoredKey:
+    """Generate a key that expires at `exp`, save it, and return the stored row."""
+    pem = serialize_private_key(generate_private_key())
+    return StoredKey(kid=db.insert_key(pem, exp), pem=pem, exp=exp)
 
-    def __init__(self, now: float | None = None) -> None:
-        now = int(time.time() if now is None else now)
-        self.valid = generate_key(now + VALID_LIFETIME_SECONDS)
-        self.expired = generate_key(now - EXPIRED_AGE_SECONDS)
 
-    def unexpired_keys(self, now: float | None = None) -> list[KeyRecord]:
-        return [k for k in (self.valid, self.expired) if not k.is_expired(now)]
+def ensure_key(db: KeyDatabase, *, expired: bool, now: int) -> StoredKey:
+    """Return a valid (or expired) key from the DB, creating one if none exists."""
+    found = db.get_key(expired=expired, now=now)
+    if found:
+        return found
+    offset = -EXPIRED_AGE_SECONDS if expired else VALID_LIFETIME_SECONDS
+    return create_key(db, now + offset)
 
-    def jwks(self, now: float | None = None) -> dict[str, list[dict[str, str]]]:
-        """JWKS document containing only keys that have not expired."""
-        return {"keys": [k.to_jwk() for k in self.unexpired_keys(now)]}
+
+def seed_keys(db: KeyDatabase, now: int) -> None:
+    """Make sure the DB holds at least one expired key and one unexpired key."""
+    ensure_key(db, expired=True, now=now)
+    ensure_key(db, expired=False, now=now)
